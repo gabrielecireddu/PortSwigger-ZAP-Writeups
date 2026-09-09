@@ -523,7 +523,51 @@ Referer: [https://target.com/admin](https://target.com/admin)
 
 ---
 
-*(Le sezioni da 8 a 14 sono in fase di stesura...)*
+# 8. File Upload Vulnerabilities
+
+Le vulnerabilità di File Upload si verificano quando un'applicazione web consente il caricamento di file senza validare in modo robusto il nome, il tipo, la dimensione o il contenuto. Questo vettore di attacco è tra i più critici, poiché permette facilmente di caricare **Web Shell** per ottenere una Remote Code Execution (RCE).
+
+**Payload base (Web Shell PHP):**
+```php
+<?php echo file_get_contents('/home/carlos/secret'); ?>
+```
+
+## 8.1 Tecniche di Evasione e Bypass
+
+### 1. Bypass del Content-Type
+Il server potrebbe validare il file solo in base all'header `Content-Type` fornito dal browser.
+*   **Azione:** Intercettare la richiesta POST con **OWASP ZAP** e modificare l'header della parte multipart associata al file da `application/x-php` a `image/jpeg`.
+
+### 2. Path Traversal nel Filename
+Per evitare che gli script vengano eseguiti, i server spesso rimuovono i permessi di esecuzione dalla cartella di upload (es. `/avatars/`).
+*   **Azione:** Modificare il parametro `filename` iniettando sequenze di directory traversal, possibilmente encodate (es. `filename="..%2fexploit.php"`). Il file verrà salvato in una directory genitrice priva di restrizioni.
+
+### 3. Blacklist Bypass e Server Config Override
+Se il server blocca esplicitamente l'estensione `.php`, è possibile sfruttare i file di configurazione (es. `.htaccess` per Apache).
+*   **Azione:** Caricare un file chiamato `.htaccess` con la direttiva:
+    ```apache
+    AddType application/x-httpd-php .l33t
+    ```
+    Successivamente, caricare il payload malevolo rinominato in `exploit.l33t`. Il server lo eseguirà come codice PHP.
+
+### 4. Offuscamento con Null Byte
+Quando le validazioni sono scritte in linguaggi di alto livello ma salvate tramite API in C/C++, il Null Byte (`%00`) agisce da terminatore di stringa.
+*   **Azione:** Rinominare il payload in `exploit.php%00.jpg`. La validazione vedrà un file JPG valido, ma il filesystem lo salverà come `exploit.php`.
+
+### 5. Polyglot Files (Flawed Content Validation)
+I server più robusti leggono i *Magic Bytes* del file o ne controllano le dimensioni (es. tramite librerie grafiche).
+*   **Azione:** Creare un'immagine valida (Polyglot) che contenga la Web Shell nei metadati EXIF utilizzando `ExifTool`:
+    ```bash
+    exiftool -Comment="<?php echo file_get_contents('/home/carlos/secret'); ?>" image.jpg -o polyglot.php
+    ```
+
+### 6. Race Conditions
+Alcuni sistemi caricano il file sul disco e lo scansionano *successivamente*, cancellandolo in caso di esito negativo. Sebbene la cancellazione avvenga in pochi millisecondi, il file esiste fisicamente per un breve istante.
+*   **Azione (ZAP Fuzzer):** Configurare un attacco concorrente. Spammare richieste `POST` per il caricamento del file e, contemporaneamente, inviare una valanga di richieste `GET` verso la path di destinazione (es. `/files/avatars/exploit.php`). Se una `GET` colpisce la frazione di secondo esatta prima della cancellazione, il codice verrà eseguito con successo.
+
+---
+
+*(Le sezioni da 9 a 14 sono in fase di stesura...)*
 
 ---
 
