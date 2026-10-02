@@ -1,6 +1,14 @@
 # 🛡️ Web Application Penetration Testing: Comprehensive Write-ups & Methodology
 **Autore:** Gabriele Cireddu
 
+> ⚠️ **Disclaimer**
+> 
+> Tutte le informazioni, le metodologie e gli script forniti in questo repository sono redatti **esclusivamente a scopo educativo e di ricerca**. Le tecniche descritte sono state studiate, testate e documentate all'interno di ambienti di laboratorio isolati e deliberatamente vulnerabili, nello specifico i laboratori forniti dalla *PortSwigger Web Security Academy*, con l'esplicita autorizzazione della piattaforma stessa.
+> 
+> L'autore declina ogni responsabilità per l'uso improprio o illegale delle informazioni qui contenute. Nessuno dei concetti, exploit o script presenti in questa guida deve essere utilizzato contro sistemi o reti informatiche senza l'esplicita autorizzazione scritta dei rispettivi proprietari. Eseguire test di sicurezza su infrastrutture non autorizzate è un reato. 
+> 
+> Studiate per difendere, non per attaccare.
+
 Questo documento raccoglie metodologie, write-up e script di automazione derivanti dal completamento del percorso formativo della **PortSwigger Web Security Academy** ancora in corso di svolgimento. Sebbene i laboratori dell'Academy siano nativamente progettati per insegnare l'utilizzo di Burp Suite, ho deciso di affrontare questo percorso utilizzando prevalentemente **OWASP ZAP (ZED Attack Proxy)**. 
 
 L'obiettivo è dimostrare un approccio "tool-agnostic" allo sfruttamento delle vulnerabilità. L'automazione di task complessi è stata implementata scrivendo script custom *ECMAScript* integrati nel motore di ZAP, il cui codice sorgente è condiviso in appendice. Le tecniche di fuzzing e interazione out-of-band sono state adattate per sfruttare gli strumenti nativi di ZAP.
