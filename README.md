@@ -72,6 +72,12 @@ L'obiettivo è dimostrare un approccio "tool-agnostic" allo sfruttamento delle v
         *   [10.3 Blind XXE e OAST (Out-Of-Band Data Exfiltration)](#103-blind-xxe-e-oast-out-of-band-data-exfiltration)
         *   [10.4 Error-Based Blind XXE & Local DTD Repurposing](#104-error-based-blind-xxe--local-dtd-repurposing)
         *   [10.5 Prevenzione e Mitigazione](#105-prevenzione-e-mitigazione)
+    *   [11. NoSQL Injection](#11-nosql-injection)
+        *   [11.1 NoSQL Syntax Injection](#111-nosql-syntax-injection)
+        *   [11.2 NoSQL Operator Injection](#112-nosql-operator-injection)
+        *   [11.3 Data Extraction tramite Iniezione JavaScript](#113-data-extraction-tramite-iniezione-javascript)
+        *   [11.4 Timing-Based NoSQL Injection](#114-timing-based-nosql-injection)
+        *   [11.5 Prevenzione e Mitigazione](#115-prevenzione-e-mitigazione)
 *   [Parte 2: Client-Side Vulnerabilities](#parte-2-client-side-vulnerabilities)
 *   [Parte 3: Advanced Topics](#parte-3-advanced-topics)
 *   [Appendice: OWASP ZAP Automation Scripts](#appendice-owasp-zap-automation-scripts)
@@ -748,7 +754,87 @@ La causa principale delle vulnerabilità XXE è il supporto abilitato di default
 
 ---
 
-*(Le sezioni da 11 a 14 sono in fase di stesura...)*
+### 11. NoSQL Injection
+
+I database NoSQL (come MongoDB) memorizzano e recuperano i dati in formati flessibili (es. JSON/BSON) anziché in tabelle relazionali. La NoSQL Injection si verifica quando un attaccante riesce a interferire con le query inviate a questi database, permettendo il bypass dell'autenticazione, l'estrazione di dati sensibili o l'esecuzione di codice JavaScript lato server.
+
+A differenza delle SQLi standard, le NoSQLi dipendono fortemente dal linguaggio di interrogazione specifico del database e dalla struttura dei dati. Si dividono principalmente in due categorie: **Syntax Injection** e **Operator Injection**.
+
+#### 11.1 NoSQL Syntax Injection
+Questa vulnerabilità si verifica quando l'input dell'utente non viene sanitizzato e rompe la sintassi della query originale, permettendo l'iniezione di logica arbitraria.
+
+**1. Fuzzing e Rilevamento:**
+Per testare la presenza della vulnerabilità (es. in MongoDB), si inviano stringhe di fuzzing contenenti caratteri speciali via URL o JSON. Se l'applicazione risponde con un errore di sintassi, il parametro è vulnerabile.
+```http
+# Fuzz string per MongoDB
+'"`{;$Foo}$Foo \xYZ\u0000
+
+# Esempio via URL (URL-encoded)
+/product/lookup?category='%22%60%7b%0d%0a%3b%24Foo%7d%0d%0a%24Foo%20%5cxYZ%00
+```
+
+**2. Override delle Condizioni (Boolean Injection):**
+Una volta confermata la vulnerabilità, è possibile sovrascrivere le condizioni per forzare il database a restituire tutti i record (es. per visualizzare prodotti nascosti o non rilasciati).
+```javascript
+# Payload: '||1||'
+/product/lookup?category=Gifts'||1||'
+
+# Payload con Null Byte per ignorare i filtri successivi (es. && released=1)
+/product/lookup?category=Gifts'%00
+```
+
+#### 11.2 NoSQL Operator Injection
+MongoDB utilizza operatori di query specifici (iniziano con `$`) per filtrare i dati, come `$ne` (not equal), `$in` (in array), o `$regex` (regular expression). Se l'applicazione accetta input JSON senza validarne il tipo, un attaccante può sostituire una semplice stringa con un oggetto contenente un operatore.
+
+**1. Bypass dell'Autenticazione:**
+Sostituendo il campo password (o username) con l'operatore `$ne`, la query cercherà un utente la cui password "non è uguale a" una stringa vuota, autenticando l'attaccante come il primo utente trovato nel database (spesso l'admin).
+```json
+# Richiesta originale
+{"username":"wiener","password":"peter"}
+
+# Richiesta malevola tramite ZAP Requester
+{"username":"admin","password":{"$ne":""}}
+{"username":{"$regex":"admin.*"},"password":{"$ne":""}}
+```
+
+#### 11.3 Data Extraction tramite Iniezione JavaScript
+In MongoDB, operatori come `$where` o la funzione `mapReduce()` permettono l'esecuzione di codice JavaScript direttamente sul database. Se l'applicazione utilizza questi operatori, l'attaccante può esfiltrare dati carattere per carattere.
+
+**1. Enumerazione della lunghezza e dei caratteri (ZAP Fuzzer):**
+Se non possiamo visualizzare la password, possiamo dedurla forzando risposte condizionali (es. "Account locked" vs "Invalid password").
+```javascript
+# Individuazione della lunghezza della password
+administrator' && this.password.length < 30 || 'a'=='b
+
+# Enumerazione dei caratteri (Fuzzing con 2 payload position)
+administrator' && this.password[0]=='a
+```
+*Metodologia con OWASP ZAP:* Si intercetta la richiesta e la si invia al Fuzzer. Si evidenzia l'indice dell'array (es. `[0]`) e il carattere da testare (es. `'a'`) assegnando due wordlist separate. ZAP testerà tutte le combinazioni incrociate per ricostruire la password in base ai cambiamenti nella risposta HTTP.
+
+**2. Estrazione di Campi Sconosciuti (Field Name Enumeration):**
+Se la struttura del database è ignota (es. cerchiamo il token di reset della password), possiamo usare la funzione JavaScript `Object.keys(this)` per scorrere le chiavi dell'oggetto utente.
+```json
+# Estrazione del nome del secondo campo dell'oggetto JSON
+"$where":"Object.keys(this)[1].match('^.{0}a.*')"
+```
+Fuzzando l'indice dell'array `.{0}` e la lettera `a`, possiamo ricostruire il nome esatto del campo segreto (es. `resetToken`).
+
+#### 11.4 Timing-Based NoSQL Injection
+Se l'applicazione gestisce gli errori e restituisce risposte identiche indipendentemente dall'esito della query (Blind totale), è possibile iniettare istruzioni temporali per inferire l'esito della condizione booleana misurando l'RTT (Round Trip Time).
+```javascript
+# Esecuzione di uno sleep(5000) solo se la password inizia per 'a'
+admin'+function(x){if(x.password[0]==="a"){sleep(5000)};}(this)+'
+```
+
+#### 11.5 Prevenzione e Mitigazione
+Per proteggere le applicazioni dalle NoSQL Injection:
+*   **Type Checking e Sanitizzazione:** Validare rigorosamente il formato e il tipo di dato dell'input. Se ci si aspetta una stringa, rifiutare eventuali oggetti JSON o array.
+*   **Evitare query dinamiche:** Utilizzare query parametrizzate o librerie ODM (Object Data Modeling) come Mongoose, che mappano i dati su schemi rigidi.
+*   **Disabilitare l'esecuzione JS:** Nelle configurazioni del database (es. in MongoDB), disabilitare l'esecuzione di JavaScript lato server (es. `javascriptEnabled: false`) se non strettamente necessaria, neutralizzando operatori come `$where`.
+
+---
+
+*(Le sezioni da 12 a 14 sono in fase di stesura...)*
 
 ---
 
