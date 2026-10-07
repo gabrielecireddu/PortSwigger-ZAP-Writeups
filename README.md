@@ -86,6 +86,13 @@ L'obiettivo è dimostrare un approccio "tool-agnostic" allo sfruttamento delle v
         *   [11.3 Data Extraction tramite Iniezione JavaScript](#113-data-extraction-tramite-iniezione-javascript)
         *   [11.4 Timing-Based NoSQL Injection](#114-timing-based-nosql-injection)
         *   [11.5 Prevenzione e Mitigazione](#115-prevenzione-e-mitigazione)
+    *   [12. API Testing & Server-Side Parameter Pollution](#12-api-testing--server-side-parameter-pollution)
+        *   [12.1 API Reconnaissance e Scoperta degli Endpoint](#121-api-reconnaissance-e-scoperta-degli-endpoint)
+        *   [12.2 Sfruttamento dei Metodi HTTP e Content-Type](#122-sfruttamento-dei-metodi-http-e-content-type)
+        *   [12.3 Mass Assignment Vulnerabilities (Auto-binding)](#123-mass-assignment-vulnerabilities-auto-binding)
+        *   [12.4 Server-Side Parameter Pollution (Query String)](#124-server-side-parameter-pollution-query-string)
+        *   [12.5 Server-Side Parameter Pollution (REST URLs)](#125-server-side-parameter-pollution-rest-urls)
+        *   [12.6 Prevenzione e Mitigazione](#126-prevenzione-e-mitigazione)
 *   [Parte 2: Client-Side Vulnerabilities](#parte-2-client-side-vulnerabilities)
 *   [Parte 3: Advanced Topics](#parte-3-advanced-topics)
 *   [Appendice: OWASP ZAP Automation Scripts](#appendice-owasp-zap-automation-scripts)
@@ -842,7 +849,71 @@ Per proteggere le applicazioni dalle NoSQL Injection:
 
 ---
 
-*(Le sezioni da 12 a 14 sono in fase di stesura...)*
+### 12. API Testing & Server-Side Parameter Pollution
+
+Le API (Application Programming Interfaces) sono il cuore delle moderne architetture web. Vulnerabilità in questi layer possono compromettere l'intero backend, permettendo l'accesso non autorizzato ai dati, l'escalation dei privilegi o la manipolazione della logica di business.
+
+#### 12.1 API Reconnaissance e Scoperta degli Endpoint
+Il primo passo nel testing delle API è la mappatura della superficie d'attacco, che spesso differisce da ciò che viene utilizzato dal frontend visibile.
+*   **Analisi della Documentazione:** Ricercare endpoint classici che ospitano documentazione machine-readable (Swagger/OpenAPI), come `/api`, `/api/swagger/v1`, o `/openapi.json`. L'add-on **OpenAPI Support di OWASP ZAP** permette di importare direttamente questi file e generare l'albero delle richieste.
+*   **Endpoint Truncation:** Se si identifica un endpoint valido come `/api/user/wiener`, la rimozione iterativa del path (es. navigando a `/api/user` e poi a `/api`) può spesso rivelare directory radice non protette contenenti la documentazione dell'API.
+
+#### 12.2 Sfruttamento dei Metodi HTTP e Content-Type
+Gli endpoint API spesso supportano metodi HTTP non documentati o tollerano formati di dati imprevisti.
+*   **Circonvenzione del Metodo:** Inviando una richiesta con il metodo `OPTIONS`, il server risponderà con gli header `Allow`, rivelando i metodi supportati (es. `GET, PATCH, DELETE`).
+*   **Type Mismatch e JSON Injection:** Se un'API accetta `PATCH` per aggiornare una risorsa, potrebbe rifiutare la richiesta per un `Content-Type` errato. Intercettando la richiesta tramite ZAP e impostando `Content-Type: application/json`, è possibile inviare oggetti JSON.
+```json
+# Esempio: Alterazione del prezzo di un articolo scavalcando la UI
+PATCH /api/products/1/price HTTP/1.1
+Content-Type: application/json
+
+{"price": 0}
+```
+
+#### 12.3 Mass Assignment Vulnerabilities (Auto-binding)
+I framework moderni mappano spesso i dati in ingresso direttamente sugli oggetti del database (Auto-binding). Se l'API non utilizza una rigorosa *allowlist* dei campi modificabili, l'attaccante può iniettare parametri nascosti.
+*   **Identificazione:** Confrontare le risposte `GET` con le richieste `POST`/`PUT`. Se un endpoint `GET /api/checkout` restituisce l'oggetto completo contenente un campo `"chosen_discount"`, ma tale campo non è presente nel form di invio `POST`, si è individuato un parametro nascosto.
+*   **Exploitation:** Aggiungendo il campo nascosto nel payload JSON inviato via `POST`, il framework potrebbe processarlo e sovrascrivere l'attributo interno:
+```json
+{
+    "chosen_products": [{"product_id":"1", "quantity":1}],
+    "chosen_discount": {"percentage": 100}
+}
+```
+
+#### 12.4 Server-Side Parameter Pollution (Query String)
+Questa vulnerabilità si verifica quando un'applicazione frontend incorpora l'input dell'utente all'interno di una richiesta HTTP *server-side* verso un'API interna, senza effettuare un'adeguata codifica (URL Encoding).
+*   **Truncation (`#`) e Injection (`&`):** L'attaccante può utilizzare i caratteri URL-encoded `%23` (`#`) per troncare la query interna, e `%26` (`&`) per iniettare nuovi parametri.
+```http
+# Payload inserito dall'utente (ZAP Requester)
+username=administrator%26field=x%23
+
+# Risultato nella query eseguita internamente dal server
+GET /internal/api/search?name=administrator&field=x#&publicProfile=true
+```
+*   **Fuzzing Parametri Interni:** Utilizzando lo **ZAP Fuzzer** sul valore `field=§x§%23` con una wordlist di nomi di parametri comuni (es. *SecLists Server-Side Variable Names*), si possono scoprire campi interni come `reset_token` o `email`, permettendo il furto di token di recupero password tramite messaggi di errore parlanti o variazioni nella risposta.
+
+#### 12.5 Server-Side Parameter Pollution (REST URLs)
+Nelle API RESTful, i parametri sono spesso integrati direttamente nel path dell'URL (es. `/api/users/{username}`). Se l'input non è validato, è possibile iniettare sequenze di Path Traversal.
+*   **Path Traversal nell'API Interna:** Inviando `../` url-encodato come parte del parametro, si può forzare l'API interna a navigare fuori dall'endpoint previsto.
+```http
+# Payload per "uscire" dalla rotta /users/ e cercare API docs
+username=../../../../openapi.json%23
+
+# Payload per forzare la lettura di un token da una vecchia versione API (v1)
+username=../../v1/users/administrator/field/passwordResetToken%23
+```
+Se il client HTTP interno normalizza i path (risolvendo i `../`), la richiesta malevola andrà a buon fine, consentendo di leggere endpoint interni non esposti al pubblico.
+
+#### 12.6 Prevenzione e Mitigazione
+Per mettere in sicurezza le API e prevenire l'inquinamento dei parametri:
+*   Implementare rigorose **Allowlist** sia per i metodi HTTP (`GET`, `POST`, ecc.) sia per i campi modificabili (Dati Ingressivi), evitando il binding diretto su oggetti del database.
+*   Applicare l'**URL Encoding** su tutti gli input degli utenti prima di incorporarli in richieste HTTP destinate ad API interne o di terze parti.
+*   Mantenere la protezione e i controlli di accesso coerenti su tutte le versioni dell'API (es. deprecando e disattivando le rotte `/v1/` vulnerabili).
+
+---
+
+*(Le sezioni da 13 a 14 sono in fase di stesura...)*
 
 ---
 
